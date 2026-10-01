@@ -414,6 +414,12 @@ impl Runtime {
             .collect::<Vec<_>>();
         for name in removed {
             if let Some(session) = self.sessions.remove(&name) {
+                if self.idle_brightness.is_some() {
+                    // Usually the output is powered down (DPMS off, lid closed), so this
+                    // is invisible. Otherwise it wakes up dimmed until the session
+                    // restarts after resume.
+                    session.leave_idle().await;
+                }
                 session.stop().await;
                 self.status.remove_output(&name);
                 log::info!("Stopped using output '{name}'");
@@ -688,6 +694,21 @@ impl Session {
             commands: command_tx,
             gamma_commands,
         })
+    }
+
+    async fn leave_idle(&self) {
+        // Monitors in standby often ignore DDC until ddcutil gives up after
+        // several seconds, and some wake up on DDC traffic.
+        if matches!(self.output, config::Output::DdcUtil(_)) {
+            return;
+        }
+        if let Err(error) = send_command(&self.commands, brightness::CommandAction::IdleLeave).await
+        {
+            log::debug!(
+                "Unable to restore idle brightness for '{}': {error}",
+                output_name(&self.output)
+            );
+        }
     }
 
     async fn stop(self) {
