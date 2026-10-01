@@ -128,10 +128,16 @@ impl Runtime {
     }
 
     pub async fn stop(&mut self) {
+        let idle = self.idle_brightness.is_some();
         let sessions = self
             .sessions
             .drain()
-            .map(|(_, session)| session.stop())
+            .map(|(_, session)| async move {
+                if idle {
+                    session.leave_idle().await;
+                }
+                session.stop().await;
+            })
             .collect::<Vec<_>>();
         join_all(sessions).await;
     }
@@ -178,13 +184,18 @@ impl Runtime {
                 .await
             }
             idle::Event::Resumed => {
-                if self.idle_brightness.take().is_none() {
+                if self.idle_brightness.is_none() {
                     return;
                 }
                 self.status.set_idled(false);
                 log::debug!("User became active");
-                self.output_commands(None, || brightness::CommandAction::IdleLeave)
-                    .await
+                let result = self
+                    .output_commands(None, || brightness::CommandAction::IdleLeave)
+                    .await;
+                // Cleared only afterwards, so a shutdown signal that cancels this
+                // midway still makes `stop` restore the outputs not reached yet.
+                self.idle_brightness = None;
+                result
             }
         };
         if let Err(error) = result {
