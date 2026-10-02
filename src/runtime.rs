@@ -424,13 +424,15 @@ impl Runtime {
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         for name in removed {
-            if let Some(session) = self.sessions.remove(&name) {
-                if self.idle_brightness.is_some() {
+            if self.idle_brightness.is_some() {
+                if let Some(session) = self.sessions.get(&name) {
                     // Usually the output is powered down (DPMS off, lid closed), so this
                     // is invisible. Otherwise it wakes up dimmed until the session
                     // restarts after resume.
                     session.leave_idle().await;
                 }
+            }
+            if let Some(session) = self.sessions.remove(&name) {
                 session.stop().await;
                 self.status.remove_output(&name);
                 log::info!("Stopped using output '{name}'");
@@ -708,11 +710,6 @@ impl Session {
     }
 
     async fn leave_idle(&self) {
-        // Monitors in standby often ignore DDC until ddcutil gives up after
-        // several seconds, and some wake up on DDC traffic.
-        if matches!(self.output, config::Output::DdcUtil(_)) {
-            return;
-        }
         if let Err(error) = send_command(&self.commands, brightness::CommandAction::IdleLeave).await
         {
             log::debug!(
@@ -809,5 +806,218 @@ fn log_discovered(output: &config::Output) {
             output.name,
             output.identifier
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use macro_rules_attribute::apply;
+    use smol_macros::test;
+
+    fn runtime(idle: bool) -> Runtime {
+        let (registrations, _) = channel::unbounded();
+        let (_, commands) = channel::unbounded();
+        let mut runtime = Runtime::new(
+            Vec::new(),
+            als::Scale::Lux,
+            HashMap::new(),
+            registrations,
+            commands,
+            crate::control::Hub::new("none"),
+            None,
+        );
+        runtime.idle_brightness = idle.then_some(30);
+        runtime
+    }
+
+    fn add_session(runtime: &mut Runtime, name: &str, ddc: bool) -> Receiver<brightness::Command> {
+        let output = if ddc {
+            config::Output::DdcUtil(config::DdcUtilOutput {
+                name: name.to_string(),
+                identifier: name.to_string(),
+                identifier_overridden: false,
+                capturer: config::Capturer::None,
+                vulkan_device: config::VulkanDevice::Auto,
+                min_brightness: 1,
+                predictor: config::Predictor::Adaptive,
+                gamma: false,
+                enabled: true,
+            })
+        } else {
+            config::Output::Backlight(config::BacklightOutput {
+                name: name.to_string(),
+                path: String::new(),
+                capturer: config::Capturer::None,
+                vulkan_device: config::VulkanDevice::Auto,
+                min_brightness: 1,
+                kind: config::BacklightKind::Display,
+                predictor: config::Predictor::Adaptive,
+                als_direction: predictor::AlsDirection::Increasing,
+                gamma: false,
+                enabled: true,
+            })
+        };
+        let (commands, receiver) = channel::unbounded();
+        let active = Arc::new(AtomicBool::new(true));
+        let capture_active = active.clone();
+        runtime.sessions.insert(
+            name.to_string(),
+            Session {
+                output,
+                active,
+                brightness: smol::spawn(std::future::pending()),
+                capturer: smol::spawn(async move {
+                    while capture_active.load(Ordering::Relaxed) {
+                        smol::Timer::after(Duration::from_millis(1)).await;
+                    }
+                }),
+                gamma: None,
+                commands,
+                gamma_commands: None,
+            },
+        );
+        receiver
+    }
+
+    async fn acknowledge_restore(commands: &Receiver<brightness::Command>) {
+        let command = commands.recv().await.unwrap();
+        assert!(matches!(
+            command.action,
+            brightness::CommandAction::IdleLeave
+        ));
+        command.response.send(Ok(80)).await.unwrap();
+    }
+
+    #[apply(test!)]
+    async fn shutdown_restores_all_idle_backlights() {
+        let mut runtime = runtime(true);
+        let first = add_session(&mut runtime, "first", false);
+        let second = add_session(&mut runtime, "second", false);
+        futures_util::join!(
+            runtime.stop(),
+            acknowledge_restore(&first),
+            acknowledge_restore(&second)
+        );
+        assert!(runtime.sessions.is_empty());
+    }
+
+    #[apply(test!)]
+    async fn active_shutdown_does_not_restore_brightness() {
+        let mut runtime = runtime(false);
+        let commands = add_session(&mut runtime, "panel", false);
+        runtime.stop().await;
+        assert!(commands.is_empty());
+    }
+
+    #[apply(test!)]
+    async fn idle_shutdown_restores_ddc_brightness() {
+        let mut runtime = runtime(true);
+        let commands = add_session(&mut runtime, "monitor", true);
+        futures_util::join!(runtime.stop(), acknowledge_restore(&commands));
+        assert!(runtime.sessions.is_empty());
+    }
+
+    #[apply(test!)]
+    async fn removal_restores_idle_outputs() {
+        for ddc in [false, true] {
+            let mut runtime = runtime(true);
+            let commands = add_session(&mut runtime, "output", ddc);
+            futures_util::join!(runtime.reconcile(), acknowledge_restore(&commands));
+            assert!(runtime.sessions.is_empty());
+        }
+    }
+
+    #[apply(test!)]
+    async fn removal_does_not_restore_active_outputs() {
+        for ddc in [false, true] {
+            let mut runtime = runtime(false);
+            let commands = add_session(&mut runtime, "output", ddc);
+            runtime.reconcile().await;
+            assert!(runtime.sessions.is_empty());
+            assert!(commands.is_empty());
+        }
+    }
+
+    #[apply(test!)]
+    async fn shutdown_continues_after_restoration_errors() {
+        let mut runtime = runtime(true);
+        let failed = add_session(&mut runtime, "failed", false);
+        let stopped = add_session(&mut runtime, "stopped", false);
+        drop(stopped);
+        futures_util::join!(runtime.stop(), async {
+            let command = failed.recv().await.unwrap();
+            assert!(matches!(
+                command.action,
+                brightness::CommandAction::IdleLeave
+            ));
+            command
+                .response
+                .send(Err("write failed".to_string()))
+                .await
+                .unwrap();
+        });
+        assert!(runtime.sessions.is_empty());
+    }
+
+    #[apply(test!)]
+    async fn cancelled_removal_keeps_session_for_shutdown_restoration() {
+        let mut runtime = runtime(true);
+        let commands = add_session(&mut runtime, "panel", false);
+        smol::future::race(runtime.reconcile(), async {
+            let command = commands.recv().await.unwrap();
+            assert!(matches!(
+                command.action,
+                brightness::CommandAction::IdleLeave
+            ));
+        })
+        .await;
+        assert!(runtime.sessions.contains_key("panel"));
+        futures_util::join!(runtime.stop(), acknowledge_restore(&commands));
+        assert!(runtime.sessions.is_empty());
+    }
+
+    #[apply(test!)]
+    async fn cancelled_resume_keeps_idle_state_for_shutdown_restoration() {
+        let mut runtime = runtime(true);
+        let first = add_session(&mut runtime, "first", false);
+        let second = add_session(&mut runtime, "second", false);
+        smol::future::race(runtime.idle_event(idle::Event::Resumed), async {
+            let command = smol::future::race(first.recv(), second.recv())
+                .await
+                .unwrap();
+            assert!(matches!(
+                command.action,
+                brightness::CommandAction::IdleLeave
+            ));
+            command.response.send(Ok(80)).await.unwrap();
+            let command = smol::future::race(first.recv(), second.recv())
+                .await
+                .unwrap();
+            assert!(matches!(
+                command.action,
+                brightness::CommandAction::IdleLeave
+            ));
+        })
+        .await;
+        assert!(runtime.idle_brightness.is_some());
+        futures_util::join!(
+            runtime.stop(),
+            acknowledge_restore(&first),
+            acknowledge_restore(&second)
+        );
+    }
+
+    #[apply(test!)]
+    async fn completed_resume_clears_idle_state() {
+        let mut runtime = runtime(true);
+        let commands = add_session(&mut runtime, "panel", false);
+        futures_util::join!(
+            runtime.idle_event(idle::Event::Resumed),
+            acknowledge_restore(&commands)
+        );
+        assert!(runtime.idle_brightness.is_none());
+        runtime.stop().await;
+        assert!(commands.is_empty());
     }
 }
