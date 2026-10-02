@@ -192,8 +192,6 @@ impl Runtime {
                 let result = self
                     .output_commands(None, || brightness::CommandAction::IdleLeave)
                     .await;
-                // Cleared only afterwards, so a shutdown signal that cancels this
-                // midway still makes `stop` restore the outputs not reached yet.
                 self.idle_brightness = None;
                 result
             }
@@ -409,6 +407,11 @@ impl Runtime {
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         for name in stopped {
+            if self.idle_brightness.is_some() {
+                if let Some(session) = self.sessions.get(&name) {
+                    session.leave_idle().await;
+                }
+            }
             if let Some(session) = self.sessions.remove(&name) {
                 session.stop().await;
                 self.status.remove_output(&name);
@@ -426,9 +429,6 @@ impl Runtime {
         for name in removed {
             if self.idle_brightness.is_some() {
                 if let Some(session) = self.sessions.get(&name) {
-                    // Usually the output is powered down (DPMS off, lid closed), so this
-                    // is invisible. Otherwise it wakes up dimmed until the session
-                    // restarts after resume.
                     session.leave_idle().await;
                 }
             }
@@ -926,6 +926,20 @@ mod tests {
             futures_util::join!(runtime.reconcile(), acknowledge_restore(&commands));
             assert!(runtime.sessions.is_empty());
         }
+    }
+
+    #[apply(test!)]
+    async fn unexpected_capture_stop_restores_idle_brightness() {
+        let mut runtime = runtime(true);
+        let commands = add_session(&mut runtime, "panel", false);
+        let session = runtime.sessions.get_mut("panel").unwrap();
+        session.active.store(false, Ordering::Relaxed);
+        while !session.capturer.is_finished() {
+            smol::Timer::after(Duration::from_millis(1)).await;
+        }
+        futures_util::join!(runtime.reconcile(), acknowledge_restore(&commands));
+        assert!(runtime.sessions.is_empty());
+        assert!(runtime.failures.contains_key("panel"));
     }
 
     #[apply(test!)]
